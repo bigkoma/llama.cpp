@@ -4927,7 +4927,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
 }  // namespace ggml::cpu::repack
 
+#if defined(__GLIBC__) && defined(__AVX2__)
+#include "ik-r4-zen2.h"
+#endif
+
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
+#if defined(__GLIBC__) && defined(__AVX2__)
+    if ((cur->type == GGML_TYPE_Q4_K || cur->type == GGML_TYPE_Q6_K) &&
+        ggml_n_dims(cur) == 2 && cur->ne[0] % 256 == 0 && cur->ne[1] % 4 == 0 &&
+        ggml_is_contiguous(cur) && ggml::cpu::repack::ik_r4_ops().multiply) {
+        static const ggml::cpu::repack::ik_r4_traits traits;
+        return &traits;
+    }
+#endif
     // instance for Q1_0
     static const ggml::cpu::repack::tensor_traits<block_q1_0, 4, 4, GGML_TYPE_Q8_0> q1_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q1_0, 8, 4, GGML_TYPE_Q8_0> q1_0_4x8_q8_0;

@@ -1,5 +1,8 @@
 #include "models.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #include "llama-impl.h"
 
 void llama_model_dflash::load_tensors_dflash2() {
@@ -117,7 +120,7 @@ ggml_tensor * llama_model_dflash::build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, int64_t skip) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -129,7 +132,8 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t rank     = hparams.dflash_selector_rank;
     const int64_t n_blocks = g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
-    GGML_ASSERT(res->t_logits->ne[1] == n_tokens);
+    GGML_ASSERT(skip == 0 || (skip == 1 && n_blocks == 1 && n_tokens > 1));
+    GGML_ASSERT(res->t_logits->ne[1] == n_tokens - skip);
     if (!tokens) {
         return;
     }
@@ -137,28 +141,34 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t tokens_per_block = n_tokens / n_blocks;
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
+    const int64_t n_scores   = n_tokens - skip;
+    const int64_t scored_per_block = tokens_per_block - skip;
 
     ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_scores);
     ggml_tensor * unary       = ggml_reshape_2d(ctx0,
-            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
-    ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
+            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_scores);
+    ggml_tensor * hidden = res->t_embd;
+    if (skip) {
+        hidden = ggml_view_2d(ctx0, hidden, hidden->ne[0], n_scores, hidden->nb[1], hidden->nb[1]);
+    }
+    ggml_tensor * gate = g.build_lora_mm(model.dflash_selector_hidden, hidden);
 
     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
     // position varies fastest, sequences are the outer dimension.
-    ggml_tensor * cand_blk  = ggml_reshape_3d(ctx0, candidates, top_k, tokens_per_block, n_blocks);
-    ggml_tensor * unary_blk = ggml_reshape_3d(ctx0, unary,      top_k, tokens_per_block, n_blocks);
-    ggml_tensor * gate_blk  = ggml_reshape_3d(ctx0, gate,       rank,  tokens_per_block, n_blocks);
+    ggml_tensor * cand_blk  = ggml_reshape_3d(ctx0, candidates, top_k, scored_per_block, n_blocks);
+    ggml_tensor * unary_blk = ggml_reshape_3d(ctx0, unary,      top_k, scored_per_block, n_blocks);
+    ggml_tensor * gate_blk  = ggml_reshape_3d(ctx0, gate,       rank,  scored_per_block, n_blocks);
 
     // a position's score reads only the candidate sets at pos-1 and pos, so a run
     // of positions has no internal dependency and scores in one batched matmul
     auto score_run = [&](int64_t beg_pos, int64_t n_pos, ggml_tensor * pred_ids) {
         ggml_tensor * cand_run = ggml_cont(ctx0, ggml_view_3d(ctx0, cand_blk, top_k, n_pos, n_blocks,
-                    cand_blk->nb[1], cand_blk->nb[2], beg_pos * cand_blk->nb[1]));
+                    cand_blk->nb[1], cand_blk->nb[2], (beg_pos - skip) * cand_blk->nb[1]));
         ggml_tensor * unary_run = ggml_cont(ctx0, ggml_view_3d(ctx0, unary_blk, top_k, n_pos, n_blocks,
-                    unary_blk->nb[1], unary_blk->nb[2], beg_pos * unary_blk->nb[1]));
+                    unary_blk->nb[1], unary_blk->nb[2], (beg_pos - skip) * unary_blk->nb[1]));
         ggml_tensor * gate_run = ggml_cont(ctx0, ggml_view_3d(ctx0, gate_blk, rank, n_pos, n_blocks,
-                    gate_blk->nb[1], gate_blk->nb[2], beg_pos * gate_blk->nb[1]));
+                    gate_blk->nb[1], gate_blk->nb[2], (beg_pos - skip) * gate_blk->nb[1]));
 
         const int64_t n_pred = pred_ids->ne[0] / (n_pos * n_blocks);
 
@@ -197,7 +207,7 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     if (block_size > 2) {
         ggml_tensor * prev_ids = ggml_reshape_1d(ctx0,
                 ggml_cont(ctx0, ggml_view_3d(ctx0, cand_blk, top_k, block_size - 2, n_blocks,
-                        cand_blk->nb[1], cand_blk->nb[2], cand_blk->nb[1])),
+                        cand_blk->nb[1], cand_blk->nb[2], (1 - skip) * cand_blk->nb[1])),
                 top_k * (block_size - 2) * n_blocks);
         packed = ggml_concat(ctx0, packed, score_run(2, block_size - 2, prev_ids), 1);
     }
@@ -218,7 +228,18 @@ llama_model_dflash::graph_dflash2::graph_dflash2(const llm_graph_params & params
     ggml_tensor * inp_tokens = build_inp_tokens();
     ggml_tensor * cur        = build_layers(inp_tokens);
 
+    static const bool prune_anchor = [] {
+        const char * setting = std::getenv("LLAMA_DFLASH_SKIP_ANCHOR_HEAD");
+        return setting && std::strcmp(setting, "1") == 0;
+    }();
+    // The sampler reads the packed lattice only. Its first row is always zero and
+    // the successor of the anchor is conditioned directly on the input token ID.
+    const int64_t skip = prune_anchor && n_outputs == 0 && ubatch.n_seqs_unq == 1 && n_tokens > 1;
+    if (skip) {
+        static const bool reported = [] { LLAMA_LOG_INFO("DFlash2 omitted the unused anchor head column\n"); return true; }();
+        (void) reported;
+        cur = ggml_view_2d(ctx0, cur, cur->ne[0], n_tokens - 1, cur->nb[1], cur->nb[1]);
+    }
     build_logits(cur);
-
-    build_dflash2_selector(*this, model, inp_tokens);
+    build_dflash2_selector(*this, model, inp_tokens, skip);
 }
