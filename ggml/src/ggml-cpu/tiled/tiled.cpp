@@ -1,5 +1,9 @@
 #include "tiled.h"
 #include "tiled-kernel.h"
+#if defined(__AVX2__) && defined(__FMA__) && !defined(__AVX512VNNI__)
+#include "zen2-q45.h"
+#include <type_traits>
+#endif
 
 #include "ggml-cpu-impl.h"
 #include "ggml-cpu.h"
@@ -1007,6 +1011,23 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
 
                     // 16x16 microtiles sweeping the window; repack each src1 band before first use
                     for (int64_t ir1 = iir1; ir1 < iir1_end; ir1 += MICRO) {
+#if defined(__AVX2__) && defined(__FMA__) && !defined(__AVX512VNNI__)
+                        if constexpr (std::is_same_v<B, block_q4_K> || std::is_same_v<B, block_q5_K>) {
+                            static const bool use_packed = [] {
+                                const char * value = std::getenv("GGML_CPU_ZEN2_Q45");
+                                return value && std::strcmp(value, "1") == 0;
+                            }();
+                            if (use_packed) {
+                                alignas(32) unsigned char packed[TILED_MICRO * TILED_TILE_K];
+                                const int col = (int) (ir1 - iir1);
+                                zen_pack_group(ws->src1, packed, col);
+                                for (int64_t ir0 = iir0; ir0 < iir0_end; ir0 += MICRO) {
+                                    zen_tile(ws->src0, ws->src1, packed, (int) (ir0 - iir0), col, ws->acc, TILED_TILE_ROWS);
+                                }
+                                continue;
+                            }
+                        }
+#endif
                         tiled_repack_src1(&ws->src1, (int) (ir1 - iir1), 1, ACTBIAS);
                         for (int64_t ir0 = iir0; ir0 < iir0_end; ir0 += MICRO) {
                             tiled_run_microtile<SUBBLK, HAS_MIN, BIAS, ACTBIAS>(ws->src0, ws->src1,

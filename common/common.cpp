@@ -1448,6 +1448,14 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         return res;
     }
 
+    // A text-only proposal index needs the target vocabulary even without a draft model.
+    const auto & types = params.speculative.types;
+    const char * file_lookup = std::getenv("LLAMA_OPENCODE_FILE_LOOKUP");
+    if (file_lookup && std::strcmp(file_lookup, "1") == 0 &&
+            std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE) != types.end()) {
+        params.speculative.draft.ctx_tgt = lctx;
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {

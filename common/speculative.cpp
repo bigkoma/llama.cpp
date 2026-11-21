@@ -8,6 +8,9 @@
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
+#include "opencode-lookup.h"
+
+#include <cstdlib>
 #include "sampling.h"
 
 #include <algorithm>
@@ -2328,6 +2331,8 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
 
     // shared across all sequences
     common_ngram_simple_config config;
+    const llama_vocab * file_vocab = nullptr;
+    std::vector<common_opencode_lookup> file_lookup;
 
     common_speculative_impl_ngram_simple(
             const common_params_speculative & params, uint32_t n_seq,
@@ -2336,13 +2341,26 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
         , params(params.ngram_simple)
         , config(config)
     {
+        const char * enabled = std::getenv("LLAMA_OPENCODE_FILE_LOOKUP");
+        if (params.draft.ctx_tgt && enabled && std::strcmp(enabled, "1") == 0) {
+            file_vocab = llama_model_get_vocab(llama_get_model(params.draft.ctx_tgt));
+            file_lookup.resize(n_seq);
+            const char * adaptive = std::getenv("LLAMA_OPENCODE_ADAPTIVE");
+            if (adaptive && std::strcmp(adaptive, "1") == 0) {
+                // Only source-backed proposals need long verification batches.
+                this->config.size_mgram = std::min<uint16_t>(this->config.size_mgram, 32);
+            }
+            SPC_INF("%s", "OpenCode numbered file lookup enabled\n");
+        }
         SPC_TRC("%s", "adding speculative implementation 'ngram-simple'\n");
         SPC_TRC("- size_n=%d, size_m=%d, min_hits=%d\n",
                 this->params.size_n, this->params.size_m, this->params.min_hits);
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (file_vocab) {
+            file_lookup.at(seq_id).reset(file_vocab, prompt);
+        }
     }
 
     bool process(const common_batch & /*batch*/) override {
@@ -2359,6 +2377,10 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
                 continue;
             }
 
+            if (file_vocab && file_lookup[seq_id].propose(*dp.prompt, dp.id_last, params.size_m, *dp.result)) {
+                SPC_DBG("file lookup proposed %zu tokens\n", dp.result->size());
+                continue;
+            }
             *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last);
         }
     }
